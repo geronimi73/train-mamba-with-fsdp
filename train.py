@@ -224,7 +224,6 @@ def get_dataloader(
 
     return sampler, loader
 
-
 def get_parameter_names(model, forbidden_layer_types):
     result = []
     for name, child in model.named_children():
@@ -375,12 +374,21 @@ if __name__ == "__main__":
     #         MistralDecoderLayer,
     #     },
     # )
+    # auto_wrap_policy = functools.partial(
+    #     size_based_auto_wrap_policy, min_num_params=200_000
+    # )
+    from mamba_ssm.modules.mamba_simple import Mamba, Block
+
     auto_wrap_policy = functools.partial(
-        size_based_auto_wrap_policy, min_num_params=20000
+        transformer_auto_wrap_policy,
+        transformer_layer_cls={
+            Block,
+        },
     )
 
+
     fsdp_config = dict(
-        # auto_wrap_policy=auto_wrap_policy,
+        auto_wrap_policy=auto_wrap_policy,
         sharding_strategy=ShardingStrategy.FULL_SHARD,
         device_id=torch.cuda.current_device(),
         # mixed_precision=MixedPrecision(
@@ -395,6 +403,8 @@ if __name__ == "__main__":
     )
 
     model = FSDP(model, **fsdp_config)
+    # breakpoint()
+    print(model)
     optimizer = get_optimizer(model, lr, weight_decay)
 
     train_ds = ["data/train.jsonl"]
