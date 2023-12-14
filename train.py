@@ -1,4 +1,9 @@
-import random
+import random, functools, torch.distributed as dist, wandb, uuid, torch, transformers, os, math, numpy as np
+
+from datasets import load_dataset, DatasetDict, Dataset
+from functools import partial
+from transformers import AutoTokenizer
+
 from core.supervised_dataset import (
     DEFAULT_PAD_TOKEN,
     DEFAULT_EOS_TOKEN,
@@ -30,344 +35,89 @@ from core.multipack_sampler import MultipackDistributedBatchSampler
 from dotenv import load_dotenv
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 
-import functools
-import torch.distributed as dist
-import wandb
-import uuid
-import torch
-import transformers
-import os
-import math
-import numpy as np
+def collate(elements, tokenizer):
+    tokenlist=[e["input_ids"] for e in elements]
+    tokens_maxlen=max([len(t) for t in tokenlist])
 
-load_dotenv()
+    input_ids,labels,attention_masks = [],[],[]
+    for tokens in tokenlist:
+        pad_len=tokens_maxlen-len(tokens)
 
+        # pad input_ids with pad_token, labels with ignore_index (-100) and set attention_mask 1 where content otherwise 0
+        input_ids.append( tokens + [tokenizer.pad_token_id]*pad_len )   
+        labels.append( tokens + [-100]*pad_len )    
+        attention_masks.append( [1]*len(tokens) + [0]*pad_len ) 
 
-def disable_model_dropout(model: torch.nn.Module):
-    for module in model.modules():
-        if isinstance(module, torch.nn.Dropout):
-            module.p = 0
+    batch={
+        "input_ids": torch.tensor(input_ids),
+        "labels": torch.tensor(labels),
+    }
+    return batch
 
-
-def setup_model(model_name, max_length):
-    # config = transformers.AutoConfig.from_pretrained(
-    #     model_name,
-    #     # use_auth_token=os.environ["HF_TOKEN"],
-    # )
-
-    # config.use_cache = False
-
-    # model = transformers.AutoModelForCausalLM.from_pretrained(
-    #     model_name,
-    #     # use_auth_token=os.environ["HF_TOKEN"],
-    #     config=config,
-    #     torch_dtype=torch.bfloat16,
-    # )
-
-    # monkey patch MambaLMHeadModel.forward 
-    def forward_with_loss(self, input_ids, position_ids=None, inference_params=None, num_last_tokens=0, labels = None):
-        """
-        "position_ids" is just to be compatible with Transformer generation. We don't use it.
-        num_last_tokens: if > 0, only return the logits for the last n tokens
-        """
-        hidden_states = self.backbone(input_ids, inference_params=inference_params)
-        if num_last_tokens > 0:
-            hidden_states = hidden_states[:, -num_last_tokens:]
-        lm_logits = self.lm_head(hidden_states)
-        
-        # Source: https://github.com/huggingface/transformers/blob/80377eb018c077dba434bc8e7912bcaed3a64d09/src/transformers/models/llama/modeling_llama.py#L1196
-        if labels is not None:
-            logits = lm_logits
-            # Shift so that tokens < n predict n
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            # Flatten the tokens
-            loss_fct = CrossEntropyLoss()
-            # shift_logits = shift_logits.view(-1, self.config.vocab_size)
-            shift_logits = shift_logits.view(-1, self.backbone.embedding.weight.size()[0])
-            shift_labels = shift_labels.view(-1)
-            # Enable model parallelism
-            shift_labels = shift_labels.to(shift_logits.device)
-            loss = loss_fct(shift_logits, shift_labels)
-
-            CausalLMOutput = namedtuple("CausalLMOutput", ["loss"])
-            return CausalLMOutput(loss=loss)            
-            # return (loss,)   
-        else:
-            CausalLMOutput = namedtuple("CausalLMOutput", ["logits"])
-            return CausalLMOutput(logits=lm_logits)
-    MambaLMHeadModel.forward=forward_with_loss
-
-
-    model = MambaLMHeadModel.from_pretrained(
-        model_name,    
-        dtype=torch.float32,
-        device="cuda",
+def tokenize(element, max_length, tokenizer):
+    return tokenizer(
+        element["text"],
+        truncation=True,
+        max_length=max_length,
+        add_special_tokens=False,
     )
-
-    # tokenizer = transformers.AutoTokenizer.from_pretrained(
-    #     "EleutherAI/gpt-neox-20b",
-    #     # model_max_length=max_length,
-    #     # padding_side="right",
-    #     # use_fast=False,
-    #     # pad_token=DEFAULT_PAD_TOKEN,
-    #     # # use_auth_token=os.environ["HF_TOKEN"],
-    #     # trust_remote_code=True,
-    # )
-
-    tokenizer = transformers.AutoTokenizer.from_pretrained(
-        "models/TinyMistral-248M",
-        model_max_length=max_length,
-        padding_side="right",
-        use_fast=False,
-        pad_token=DEFAULT_PAD_TOKEN,
-        # use_auth_token=os.environ["HF_TOKEN"],
-        trust_remote_code=True,
-    )
-
-
-    # special_tokens_dict = dict()
-    # if tokenizer.pad_token is None:
-    #     special_tokens_dict["pad_token"] = DEFAULT_PAD_TOKEN
-    # if tokenizer.eos_token is None:
-    #     special_tokens_dict["eos_token"] = DEFAULT_EOS_TOKEN
-    # if tokenizer.unk_token is None:
-    #     special_tokens_dict["unk_token"] = DEFAULT_UNK_TOKEN
-
-    # tokenizer.add_special_tokens(special_tokens_dict)
-    # model.resize_token_embeddings(len(tokenizer))
-
-    return model, tokenizer
-
-
-def evaluation(
-    model,
-    eval_dataloader,
-    wandb,
-    local_rank,
-):
-    if local_rank == 0:
-        print("RUNNING EVAL")
-
-    model.eval()
-    losses = 0
-    for step, batch in enumerate(eval_dataloader):
-        inputs = {
-            "input_ids": batch["input_ids"].to("cuda"),
-            "labels": batch["labels"].to("cuda"),
-            # "attention_mask": batch["attention_mask"].to("cuda"),
-        }
-        with torch.no_grad():
-            outputs = model(**inputs)
-
-        loss = outputs.loss
-        losses += loss.float()
-
-    losses = losses / (step + 1)
-    val_loss = get_all_reduce_mean(losses.clone()).item()
-
-    # if local_rank == 0:
-    #     wandb.log(
-    #         {
-    #             "val_loss": val_loss,
-    #         }
-    #     )
-
-    return val_loss
-
 
 def get_dataloader(
-    use_multipack_sampler,
-    max_length,
     dataset,
-    world_size,
-    local_rank,
-    shuffle,
-    seed,
-    collator,
     batch_size,
+    collator,
+    fsdp_info,
+    shuffle=False,
+    seed=42,
 ):
-    if use_multipack_sampler:
-        lengths = np.array([len(tokens["input_ids"]) for tokens in dataset])
-        sampler = MultipackDistributedBatchSampler(
-            batch_max_length=batch_size * max_length,
-            lengths=lengths,
-            num_replicas=world_size,
-            rank=local_rank,
-            seed=seed,
-        )
+    fsdp_rank, fsdp_world_size = fsdp_info
 
-        loader = DataLoader(
-            dataset,
-            pin_memory=True,
-            collate_fn=collator,
-            batch_sampler=sampler,
-        )
-    else:
-        sampler = DistributedSampler(
-            dataset,
-            num_replicas=world_size,
-            rank=local_rank,
-            shuffle=shuffle,
-            seed=seed,
-        )
-
-        loader = DataLoader(
-            dataset,
-            shuffle=False,
-            pin_memory=True,
-            drop_last=True,
-            batch_size=batch_size,
-            collate_fn=collator,
-            sampler=sampler,
-        )
-
+    sampler = DistributedSampler(dataset=dataset, rank=fsdp_rank, num_replicas=fsdp_world_size, shuffle=False)
+    loader = DataLoader(
+        dataset,
+        shuffle=False,
+        pin_memory=True,
+        batch_size=batch_size,
+        collate_fn=collator,
+        sampler=sampler,
+    )
     return sampler, loader
 
-def get_parameter_names(model, forbidden_layer_types):
-    result = []
-    for name, child in model.named_children():
-        result += [
-            f"{name}.{n}"
-            for n in get_parameter_names(child, forbidden_layer_types)
-            if not isinstance(child, tuple(forbidden_layer_types))
-        ]
 
-    result += list(model._parameters.keys())
-    return result
-
-
-def get_optimizer(model, lr, weight_decay):
-    decay_parameters = get_parameter_names(model, [torch.nn.LayerNorm])
-    decay_parameters = [name for name in decay_parameters if "bias" not in name]
-    optimizer_grouped_parameters = [
-        {
-            "params": [
-                p
-                for n, p in model.named_parameters()
-                if (n in decay_parameters and p.requires_grad)
-            ],
-            "weight_decay": weight_decay,
-        },
-        {
-            "params": [
-                p
-                for n, p in model.named_parameters()
-                if (n not in decay_parameters and p.requires_grad)
-            ],
-            "weight_decay": 0.0,
-        },
-    ]
-
-    return torch.optim.AdamW(
-        params=optimizer_grouped_parameters,
-        lr=lr,
-        betas=(0.9, 0.95),
-        eps=1e-8,
-        weight_decay=weight_decay,
-    )
-
-
-def should_run_eval(total_steps, times_to_run, current_step):
-    return current_step % (total_steps // times_to_run) == 0
-
-
-def log_stats(pbar, wandb, epoch, loss_tensor, grad_norm, scheduler):
-    last_lr = scheduler.get_last_lr()[0]
-
-    # wandb.log(
-    #     {
-    #         "current_loss": loss_tensor,
-    #         "current_epoch": epoch,
-    #         "learning_rate": last_lr,
-    #         "grad_norm": grad_norm,
-    #     },
-    # )
-
-    current_loss = f"{loss_tensor:.4f}"
-    current_lr = f"{last_lr:.10f}"
-
-    pbar.set_description(f"Epoch {epoch:.2f}, Loss: {current_loss}, LR: {current_lr}")
-
-
-def get_all_reduce_mean(tensor):
-    torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM)
-    tensor = tensor / torch.distributed.get_world_size()
-    return tensor
-
-
-def get_warmup_steps(num_training_steps, warmup_ratio=0.05):
-    return math.ceil(num_training_steps * warmup_ratio)
-
-
-def clip_model_gradients(model, max_grad_norm):
-    return model.clip_grad_norm_(max_grad_norm).item()
-
-
-def get_scheduler(local_rank, scheduler_type, optimizer, max_steps):
-    warmup_steps = get_warmup_steps(max_steps)
-
-    if local_rank == 0:
-        print(f"[WARMUP STEPS]: {warmup_steps}")
-        print(f"[MAX STEPS]: {max_steps}")
-        print(f"[SCHEDULER]: {scheduler_type}")
-
-    return transformers.get_scheduler(
-        name=scheduler_type,
-        optimizer=optimizer,
-        num_warmup_steps=warmup_steps,
-        num_training_steps=max_steps,
-    )
-
-
-def save_model(local_rank, model, tokenizer, outpath, current_epoch, current_step):
-    save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-    with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
-        cpu_state = model.state_dict()
-
-    if local_rank == 0:
-        print(f"SAVING MODEL")
-        outpath += f"/epoch_{current_epoch}/step_{current_step}"
-        model.save_pretrained(outpath, state_dict=cpu_state)
-        tokenizer.save_pretrained(outpath)
-
-
-if __name__ == "__main__":
+def train():
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
+    fsdp_location = [local_rank, world_size]
+
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.cuda.set_device(local_rank)
     dist.init_process_group("nccl", rank=local_rank, world_size=world_size)
 
-    model_name = "state-spaces/mamba-1.4b"
+    # 100 Parameters
+    model_name = "state-spaces/mamba-130m"
     # model_name="models/TinyMistral-248M"
     scheduler_type = "cosine"
-    seed = 877645  # set your seed
-    transformers.set_seed(seed)
+    transformers.set_seed(42)
 
     run_id = str(uuid.uuid4())
     output_dir = f"./outputs/{model_name}/{run_id}"
     date_of_run = datetime.now().strftime("%Y-%m-%d-%I_%M_%S_%p")
-    max_length = 2048  # adjust as needed
+    max_length = 1024  
     disable_dropout = False
     gradient_checkpointing = False
     clip_gradients = True
-    shuffle = True  # multipack sampler already does random sampling
-    train_batch_size = 1  # adjust as needed
-    validation_batch_size = 2  # adjust as needed
-    epochs = 3  # adjust as needed
-    acc_steps = 0  # TODO: not implemented here yet
-    lr = 2e-05  # adjust as needed
-    weight_decay = 0.0  # adjust as needed
-    gradient_clipping = 1.0  # adjust as needed
+    shuffle = True  
+    train_batch_size, validation_batch_size = 1, 2
+    epochs = 3  
+    lr = 2e-05  
+    weight_decay = 0.0  
+    gradient_clipping = 1.0  
     train_on_inputs = False  # whether to train on instruction tokens
-    use_multipack_sampler = (
-        True  # whether to use the multipack sampler or torch sampler
-    )
 
+    # Load model and tokenizer    
     model, tokenizer = setup_model(model_name, max_length)
-    num_params = sum([p.numel() for p in model.parameters()])
+
     # auto_wrap_policy = functools.partial(
     #     transformer_auto_wrap_policy,
     #     transformer_layer_cls={
@@ -377,25 +127,19 @@ if __name__ == "__main__":
     # auto_wrap_policy = functools.partial(
     #     size_based_auto_wrap_policy, min_num_params=200_000
     # )
-    from mamba_ssm.modules.mamba_simple import Mamba, Block
 
+    # Wrap model
+    from mamba_ssm.modules.mamba_simple import Mamba, Block
     auto_wrap_policy = functools.partial(
         transformer_auto_wrap_policy,
         transformer_layer_cls={
             Block,
         },
     )
-
-
     fsdp_config = dict(
         auto_wrap_policy=auto_wrap_policy,
         sharding_strategy=ShardingStrategy.FULL_SHARD,
         device_id=torch.cuda.current_device(),
-        # mixed_precision=MixedPrecision(
-        #     param_dtype=torch.bfloat16,
-        #     reduce_dtype=torch.bfloat16,
-        #     buffer_dtype=torch.bfloat16,
-        # ),
         mixed_precision=None,
         backward_prefetch=None,
         param_init_fn=None,
@@ -403,73 +147,46 @@ if __name__ == "__main__":
     )
 
     model = FSDP(model, **fsdp_config)
-    # breakpoint()
-    print(model)
+
     optimizer = get_optimizer(model, lr, weight_decay)
 
-    train_ds = ["data/train.jsonl"]
-    val_ds = ["data/validation.jsonl"]
-    train_dataset = SupervisedDataset(train_on_inputs, tokenizer, train_ds)
-    val_dataset = SupervisedDataset(train_on_inputs, tokenizer, val_ds)
-    collator = DataCollatorForSupervisedDataset(tokenizer)
+    # load dataset
+    dataset = load_dataset("OpenAssistant/oasst_top1_2023-08-25")
+    dataset_tokenized = dataset.map(
+        partial(tokenize, max_length=512, tokenizer=tokenizer), 
+        batched=True, 
+        num_proc=os.cpu_count(),    # multithreaded
+        remove_columns=["text"]     # don't need this anymore, we have tokens from here on
+    )
 
     train_sampler, train_loader = get_dataloader(
-        use_multipack_sampler,
-        max_length,
-        train_dataset,
-        world_size,
-        local_rank,
-        shuffle,
-        seed,
-        collator,
-        train_batch_size,
-    )
-    val_sampler, val_loader = get_dataloader(
-        use_multipack_sampler,
-        max_length,
-        val_dataset,
-        world_size,
-        local_rank,
-        shuffle,
-        seed,
-        collator,
-        validation_batch_size,
+        dataset=dataset_tokenized["train"],
+        batch_size=2,
+        collator=partial(collate, tokenizer=tokenizer),
+        fsdp_info=fsdp_location
     )
 
-    if use_multipack_sampler:
-        total_steps_per_epoch = train_sampler.num_batches()
-    else:
-        total_steps_per_epoch = len(train_loader)
+    val_sampler, val_loader = get_dataloader(
+        dataset=dataset_tokenized["test"],
+        batch_size=2,
+        collator=partial(collate, tokenizer=tokenizer),
+        fsdp_info=fsdp_location
+    )
+
+    total_steps_per_epoch = len(train_loader)
 
     max_steps = total_steps_per_epoch * epochs
     scheduler = get_scheduler(local_rank, scheduler_type, optimizer, max_steps)
 
-    # if local_rank == 0:
-        # run = wandb.init(
-        #     project="mistral-7b",
-        #     name=run_id,
-        #     config={
-        #         "model_name": model_name,
-        #         "run_id": run_id,
-        #         "date": date_of_run,
-        #         "dataset_size": len(train_dataset),
-        #         "dataset": ",".join(train_ds),
-        #         "validation": ",".join(val_ds),
-        #         "weight_decay": weight_decay,
-        #         "clip_gradients": clip_gradients,
-        #         "learning_rate": lr,
-        #         "shuffle": shuffle,
-        #         "seed": seed,
-        #         "disable_dropout": disable_dropout,
-        #         "use_multipack_sampler": use_multipack_sampler,
-        #         "train_on_inputs": train_on_inputs,
-        #         "epochs": epochs,
-        #         "acc_steps": acc_steps,
-        #         "batch_size": train_batch_size,
-        #         "total_batch_size": train_batch_size * world_size,
-        #         "scheduler_type": scheduler_type,
-        #     },
-        # )
+    if local_rank == 0:
+        run = wandb.init(
+            project="mamba",
+            name="mamba-130m-OA-testrun",
+            config={
+                "model_name": model_name,
+                "run_id": run_id,
+            }
+        )
 
     if gradient_checkpointing:
         model.gradient_checkpointing_enable()
@@ -556,5 +273,197 @@ if __name__ == "__main__":
 
                 model.train()
 
-    # save final model
-    # save_model(local_rank, model, tokenizer, output_dir, epochs, "final")
+
+def disable_model_dropout(model: torch.nn.Module):
+    for module in model.modules():
+        if isinstance(module, torch.nn.Dropout):
+            module.p = 0
+
+def setup_model(model_name, max_length):
+    # monkey patch MambaLMHeadModel.forward 
+    def forward_with_loss(self, input_ids, position_ids=None, inference_params=None, num_last_tokens=0, labels = None):
+        """
+        "position_ids" is just to be compatible with Transformer generation. We don't use it.
+        num_last_tokens: if > 0, only return the logits for the last n tokens
+        """
+        hidden_states = self.backbone(input_ids, inference_params=inference_params)
+        if num_last_tokens > 0:
+            hidden_states = hidden_states[:, -num_last_tokens:]
+        lm_logits = self.lm_head(hidden_states)
+        
+        # Source: https://github.com/huggingface/transformers/blob/80377eb018c077dba434bc8e7912bcaed3a64d09/src/transformers/models/llama/modeling_llama.py#L1196
+        if labels is not None:
+            logits = lm_logits
+            # Shift so that tokens < n predict n
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            # Flatten the tokens
+            loss_fct = CrossEntropyLoss()
+            # shift_logits = shift_logits.view(-1, self.config.vocab_size)
+            shift_logits = shift_logits.view(-1, self.backbone.embedding.weight.size()[0])
+            shift_labels = shift_labels.view(-1)
+            # Enable model parallelism
+            shift_labels = shift_labels.to(shift_logits.device)
+            loss = loss_fct(shift_logits, shift_labels)
+
+            CausalLMOutput = namedtuple("CausalLMOutput", ["loss"])
+            return CausalLMOutput(loss=loss)            
+            # return (loss,)   
+        else:
+            CausalLMOutput = namedtuple("CausalLMOutput", ["logits"])
+            return CausalLMOutput(logits=lm_logits)
+    MambaLMHeadModel.forward=forward_with_loss
+
+    model = MambaLMHeadModel.from_pretrained(
+        model_name,    
+        dtype=torch.float32,
+        device="cuda",
+    )
+
+    tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b") 
+    tokenizer.pad_token = tokenizer.eos_token
+
+    # tokenizer = transformers.AutoTokenizer.from_pretrained(
+    #     "models/TinyMistral-248M",
+    #     model_max_length=max_length,
+    #     padding_side="right",
+    #     use_fast=False,
+    #     trust_remote_code=True,
+    # )
+    # tokenizer.pad_token = tokenizer.eos_token
+
+    return model, tokenizer
+
+
+def evaluation(
+    model,
+    eval_dataloader,
+    wandb,
+    local_rank,
+):
+    if local_rank == 0: print("RUNNING EVAL")
+
+    model.eval()
+    losses = 0
+    for step, batch in enumerate(eval_dataloader):
+        inputs = {
+            "input_ids": batch["input_ids"].to("cuda"),
+            "labels": batch["labels"].to("cuda"),
+        }
+        with torch.no_grad():
+            outputs = model(**inputs)
+
+        loss = outputs.loss
+        losses += loss.float()
+
+    losses = losses / (step + 1)
+    val_loss = get_all_reduce_mean(losses.clone()).item()
+
+    if local_rank == 0: wandb.log({"val_loss": val_loss})
+
+    return val_loss
+
+
+
+def get_parameter_names(model, forbidden_layer_types):
+    result = []
+    for name, child in model.named_children():
+        result += [
+            f"{name}.{n}"
+            for n in get_parameter_names(child, forbidden_layer_types)
+            if not isinstance(child, tuple(forbidden_layer_types))
+        ]
+
+    result += list(model._parameters.keys())
+    return result
+
+
+def get_optimizer(model, lr, weight_decay):
+    decay_parameters = get_parameter_names(model, [torch.nn.LayerNorm])
+    decay_parameters = [name for name in decay_parameters if "bias" not in name]
+    optimizer_grouped_parameters = [
+        {
+            "params": [
+                p
+                for n, p in model.named_parameters()
+                if (n in decay_parameters and p.requires_grad)
+            ],
+            "weight_decay": weight_decay,
+        },
+        {
+            "params": [
+                p
+                for n, p in model.named_parameters()
+                if (n not in decay_parameters and p.requires_grad)
+            ],
+            "weight_decay": 0.0,
+        },
+    ]
+
+    return torch.optim.AdamW(
+        params=optimizer_grouped_parameters,
+        lr=lr,
+        betas=(0.9, 0.95),
+        eps=1e-8,
+        weight_decay=weight_decay,
+    )
+
+
+def should_run_eval(total_steps, times_to_run, current_step):
+    return current_step % (total_steps // times_to_run) == 0
+
+
+def log_stats(pbar, wandb, epoch, loss_tensor, grad_norm, scheduler):
+    last_lr = scheduler.get_last_lr()[0]
+
+    wandb.log(
+        {
+            "current_loss": loss_tensor,
+            "current_epoch": epoch,
+            "learning_rate": last_lr,
+            "grad_norm": grad_norm,
+        },
+    )
+
+    current_loss = f"{loss_tensor:.4f}"
+    current_lr = f"{last_lr:.10f}"
+
+    pbar.set_description(f"Epoch {epoch:.2f}, Loss: {current_loss}, LR: {current_lr}")
+
+
+def get_all_reduce_mean(tensor):
+    torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM)
+    tensor = tensor / torch.distributed.get_world_size()
+    return tensor
+
+
+def get_warmup_steps(num_training_steps, warmup_ratio=0.05):
+    return math.ceil(num_training_steps * warmup_ratio)
+
+def get_scheduler(local_rank, scheduler_type, optimizer, max_steps):
+    warmup_steps = get_warmup_steps(max_steps)
+
+    return transformers.get_scheduler(
+        name=scheduler_type,
+        optimizer=optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=max_steps,
+    )
+
+def clip_model_gradients(model, max_grad_norm):
+    return model.clip_grad_norm_(max_grad_norm).item()
+
+def save_model(local_rank, model, tokenizer, outpath, current_epoch, current_step):
+    save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+    with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
+        cpu_state = model.state_dict()
+
+    if local_rank == 0:
+        print(f"SAVING MODEL")
+        outpath += f"/epoch_{current_epoch}/step_{current_step}"
+        model.save_pretrained(outpath, state_dict=cpu_state)
+        tokenizer.save_pretrained(outpath)
+
+
+if __name__ == "__main__":
+    train()
