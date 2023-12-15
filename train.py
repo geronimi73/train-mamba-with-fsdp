@@ -20,7 +20,9 @@ from torch.distributed.fsdp import (
     MixedPrecision,
     FullStateDictConfig,
     StateDictType,
+    CPUOffload
 )
+
 from torch.distributed.fsdp.fully_sharded_data_parallel import (
     ShardingStrategy,
 )
@@ -34,60 +36,10 @@ from transformers.models.mistral.modeling_mistral import MistralDecoderLayer
 from core.multipack_sampler import MultipackDistributedBatchSampler
 from dotenv import load_dotenv
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
-
-def collate(elements, tokenizer):
-    tokenlist=[e["input_ids"] for e in elements]
-    tokens_maxlen=max([len(t) for t in tokenlist])
-
-    input_ids,labels,attention_masks = [],[],[]
-    for tokens in tokenlist:
-        pad_len=tokens_maxlen-len(tokens)
-
-        # pad input_ids with pad_token, labels with ignore_index (-100) and set attention_mask 1 where content otherwise 0
-        input_ids.append( tokens + [tokenizer.pad_token_id]*pad_len )   
-        labels.append( tokens + [-100]*pad_len )    
-        attention_masks.append( [1]*len(tokens) + [0]*pad_len ) 
-
-    batch={
-        "input_ids": torch.tensor(input_ids),
-        "labels": torch.tensor(labels),
-    }
-    return batch
-
-def tokenize(element, max_length, tokenizer):
-    return tokenizer(
-        element["text"],
-        truncation=True,
-        max_length=max_length,
-        add_special_tokens=False,
-    )
-
-def get_dataloader(
-    dataset,
-    batch_size,
-    collator,
-    fsdp_info,
-    shuffle=False,
-    seed=42,
-):
-    fsdp_rank, fsdp_world_size = fsdp_info
-
-    sampler = DistributedSampler(dataset=dataset, rank=fsdp_rank, num_replicas=fsdp_world_size, shuffle=False)
-    loader = DataLoader(
-        dataset,
-        shuffle=False,
-        pin_memory=True,
-        batch_size=batch_size,
-        collate_fn=collator,
-        sampler=sampler,
-    )
-    return sampler, loader
-
+from mamba_ssm.modules.mamba_simple import Mamba, Block
 
 def train():
-    local_rank = int(os.environ["LOCAL_RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
-    fsdp_location = [local_rank, world_size]
+    local_rank, world_size = int(os.environ["LOCAL_RANK"]), int(os.environ["WORLD_SIZE"])
 
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -95,7 +47,7 @@ def train():
     dist.init_process_group("nccl", rank=local_rank, world_size=world_size)
 
     # 100 Parameters
-    model_name = "state-spaces/mamba-130m"
+    model_name = "state-spaces/mamba-1.4b"
     # model_name="models/TinyMistral-248M"
     scheduler_type = "cosine"
     transformers.set_seed(42)
@@ -103,37 +55,28 @@ def train():
     run_id = str(uuid.uuid4())
     output_dir = f"./outputs/{model_name}/{run_id}"
     date_of_run = datetime.now().strftime("%Y-%m-%d-%I_%M_%S_%p")
-    max_length = 1024  
+    max_length = 8_000  
     disable_dropout = False
     gradient_checkpointing = False
     clip_gradients = True
     shuffle = True  
-    train_batch_size, validation_batch_size = 1, 2
+    train_batch_size, validation_batch_size = 1, 1
     epochs = 3  
-    lr = 2e-05  
+    lr = 1e-05
     weight_decay = 0.0  
     gradient_clipping = 1.0  
-    train_on_inputs = False  # whether to train on instruction tokens
 
     # Load model and tokenizer    
-    model, tokenizer = setup_model(model_name, max_length)
-
-    # auto_wrap_policy = functools.partial(
-    #     transformer_auto_wrap_policy,
-    #     transformer_layer_cls={
-    #         MistralDecoderLayer,
-    #     },
-    # )
-    # auto_wrap_policy = functools.partial(
-    #     size_based_auto_wrap_policy, min_num_params=200_000
-    # )
+    print("Loading model and tokenizer")
+    model, tokenizer = setup_model(model_name)
+    print("done")
 
     # Wrap model
-    from mamba_ssm.modules.mamba_simple import Mamba, Block
     auto_wrap_policy = functools.partial(
         transformer_auto_wrap_policy,
         transformer_layer_cls={
-            Block,
+            Block
+            # Mamba
         },
     )
     fsdp_config = dict(
@@ -143,48 +86,58 @@ def train():
         mixed_precision=None,
         backward_prefetch=None,
         param_init_fn=None,
-        cpu_offload=None,
+        cpu_offload=CPUOffload(offload_params=True),
     )
-
+    print("Wrapping model")
     model = FSDP(model, **fsdp_config)
+    print("done")
 
     optimizer = get_optimizer(model, lr, weight_decay)
 
     # load dataset
-    dataset = load_dataset("OpenAssistant/oasst_top1_2023-08-25")
+    # dataset_name="OpenAssistant/oasst_top1_2023-08-25"
+    # dataset = load_dataset(dataset_name)
+    dataset_name="wikimedia/wikisource"
+    dataset=load_dataset(dataset_name, name="20231201.en")
+    dataset["train"]=dataset["train"].select(range(0, 1_000))
+    dataset=dataset["train"].train_test_split(test_size=0.05)   
+
+    # tokenize dataset
     dataset_tokenized = dataset.map(
-        partial(tokenize, max_length=512, tokenizer=tokenizer), 
+        partial(tokenize, max_length=max_length, tokenizer=tokenizer), 
         batched=True, 
-        num_proc=os.cpu_count(),    # multithreaded
+        num_proc=os.cpu_count()//world_size,    # multithreaded
         remove_columns=["text"]     # don't need this anymore, we have tokens from here on
     )
 
-    train_sampler, train_loader = get_dataloader(
-        dataset=dataset_tokenized["train"],
-        batch_size=2,
-        collator=partial(collate, tokenizer=tokenizer),
-        fsdp_info=fsdp_location
-    )
-
-    val_sampler, val_loader = get_dataloader(
-        dataset=dataset_tokenized["test"],
-        batch_size=2,
-        collator=partial(collate, tokenizer=tokenizer),
-        fsdp_info=fsdp_location
-    )
+    # Prepare data sampler and loader
+    my_get_dataloader=partial(
+            get_dataloader,
+            collator=partial(collate, tokenizer=tokenizer),
+            fsdp_info=[local_rank, world_size]
+        )
+    train_sampler, train_loader = my_get_dataloader(dataset=dataset_tokenized["train"], bs=train_batch_size)
+    val_sampler, val_loader = my_get_dataloader(dataset=dataset_tokenized["test"], bs=validation_batch_size)
 
     total_steps_per_epoch = len(train_loader)
-
     max_steps = total_steps_per_epoch * epochs
     scheduler = get_scheduler(local_rank, scheduler_type, optimizer, max_steps)
 
     if local_rank == 0:
+        print(model)
+
         run = wandb.init(
             project="mamba",
-            name="mamba-130m-OA-testrun",
+            name=model_name.split("/")[1]+f"_OA_bs-{train_batch_size}_LR-{lr}_maxlen-{max_length}_{run_id}",
             config={
                 "model_name": model_name,
                 "run_id": run_id,
+                "dataset": dataset_name,
+                "output_dir": output_dir,
+                "lr": lr,
+                "max_length": max_length,
+                "train_batch_size": train_batch_size,
+                "validation_batch_size": validation_batch_size
             }
         )
 
@@ -194,6 +147,7 @@ def train():
     if disable_dropout:
         disable_model_dropout(model)
 
+    torch.cuda.empty_cache()
     model.train()
     dist.barrier()
 
@@ -215,7 +169,6 @@ def train():
             inputs = {
                 "input_ids": batch["input_ids"].to("cuda"),
                 "labels": batch["labels"].to("cuda"),
-                # "attention_mask": batch["attention_mask"].to("cuda"),
             }
 
             # forward
@@ -273,13 +226,61 @@ def train():
 
                 model.train()
 
+def collate(elements, tokenizer):
+    tokenlist=[e["input_ids"] for e in elements]
+    tokens_maxlen=max([len(t) for t in tokenlist])
+
+    input_ids,labels,attention_masks = [],[],[]
+    for tokens in tokenlist:
+        pad_len=tokens_maxlen-len(tokens)
+
+        # pad input_ids with pad_token, labels with ignore_index (-100) and set attention_mask 1 where content otherwise 0
+        input_ids.append( tokens + [tokenizer.pad_token_id]*pad_len )   
+        labels.append( tokens + [-100]*pad_len )    
+        attention_masks.append( [1]*len(tokens) + [0]*pad_len ) 
+
+    batch={
+        "input_ids": torch.tensor(input_ids),
+        "labels": torch.tensor(labels),
+    }
+    return batch
+
+def tokenize(element, max_length, tokenizer):
+    return tokenizer(
+        element["text"],
+        truncation=True,
+        max_length=max_length,
+        add_special_tokens=False,
+    )
+
+def get_dataloader(
+    dataset,
+    bs,
+    collator,
+    fsdp_info,
+    shuffle=False,
+    seed=42,
+):
+    fsdp_rank, fsdp_world_size = fsdp_info
+
+    sampler = DistributedSampler(dataset=dataset, rank=fsdp_rank, num_replicas=fsdp_world_size, shuffle=False)
+    loader = DataLoader(
+        dataset=dataset,
+        shuffle=False,
+        pin_memory=True,
+        batch_size=bs,
+        collate_fn=collator,
+        sampler=sampler,
+    )
+    return sampler, loader
+
 
 def disable_model_dropout(model: torch.nn.Module):
     for module in model.modules():
         if isinstance(module, torch.nn.Dropout):
             module.p = 0
 
-def setup_model(model_name, max_length):
+def setup_model(model_name):
     # monkey patch MambaLMHeadModel.forward 
     def forward_with_loss(self, input_ids, position_ids=None, inference_params=None, num_last_tokens=0, labels = None):
         """
@@ -316,21 +317,10 @@ def setup_model(model_name, max_length):
 
     model = MambaLMHeadModel.from_pretrained(
         model_name,    
-        dtype=torch.float32,
-        device="cuda",
     )
 
     tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b") 
     tokenizer.pad_token = tokenizer.eos_token
-
-    # tokenizer = transformers.AutoTokenizer.from_pretrained(
-    #     "models/TinyMistral-248M",
-    #     model_max_length=max_length,
-    #     padding_side="right",
-    #     use_fast=False,
-    #     trust_remote_code=True,
-    # )
-    # tokenizer.pad_token = tokenizer.eos_token
 
     return model, tokenizer
 
