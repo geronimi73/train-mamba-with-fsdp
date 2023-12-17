@@ -1,5 +1,7 @@
 import random, functools, torch.distributed as dist, wandb, uuid, torch, transformers, os, math, numpy as np
 
+import time
+import bitsandbytes as bnb
 from datasets import load_dataset, DatasetDict, Dataset
 from functools import partial
 from transformers import AutoTokenizer
@@ -25,9 +27,16 @@ from torch.distributed.fsdp.wrap import (
     transformer_auto_wrap_policy,
     size_based_auto_wrap_policy,
 )
-
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 from mamba_ssm.modules.mamba_simple import Mamba, Block
+from pynvml import *
+
+
+def print_gpu_utilization(rank):
+    nvmlInit()
+    handle = nvmlDeviceGetHandleByIndex(0)
+    info = nvmlDeviceGetMemoryInfo(handle)
+    print(f"GPU{rank} memory occupied: {info.used//1024**2} MB.")
 
 def train():
     local_rank, world_size = int(os.environ["LOCAL_RANK"]), int(os.environ["WORLD_SIZE"])
@@ -38,9 +47,10 @@ def train():
     dist.init_process_group("nccl", rank=local_rank, world_size=world_size)
 
     # 100 Parameters
-    model_name = "state-spaces/mamba-1.4b"
-    # model_name="models/TinyMistral-248M"
-    scheduler_type = "cosine"
+    wandb_log=True
+
+    model_name = "state-spaces/mamba-130m"
+    scheduler_type = "constant"
     transformers.set_seed(42)
 
     run_id = str(uuid.uuid4())
@@ -51,7 +61,7 @@ def train():
     gradient_checkpointing = False
     clip_gradients = True
     shuffle = True  
-    train_batch_size, validation_batch_size = 1, 1
+    train_batch_size, validation_batch_size = 2, 1
     epochs = 3  
     lr = 1e-05
     weight_decay = 0.0  
@@ -76,7 +86,7 @@ def train():
         mixed_precision=None,
         backward_prefetch=None,
         param_init_fn=None,
-        cpu_offload=CPUOffload(offload_params=True),
+        cpu_offload=CPUOffload(offload_params=False),
     )
     print("Wrapping model")
     model = FSDP(model, **fsdp_config)
@@ -85,11 +95,9 @@ def train():
     optimizer = get_optimizer(model, lr, weight_decay)
 
     # load dataset
-    # dataset_name="OpenAssistant/oasst_top1_2023-08-25"
-    # dataset = load_dataset(dataset_name)
     dataset_name="wikimedia/wikisource"
     dataset=load_dataset(dataset_name, name="20231201.en")
-    dataset["train"]=dataset["train"].select(range(0, 1_000))
+    # dataset["train"]=dataset["train"].select(range(0, 1_000))
     dataset=dataset["train"].train_test_split(test_size=0.05)   
 
     # tokenize dataset
@@ -116,20 +124,21 @@ def train():
     if local_rank == 0:
         print(model)
 
-        run = wandb.init(
-            project="mamba",
-            name=model_name.split("/")[1]+f"_OA_bs-{train_batch_size}_LR-{lr}_maxlen-{max_length}_{run_id}",
-            config={
-                "model_name": model_name,
-                "run_id": run_id,
-                "dataset": dataset_name,
-                "output_dir": output_dir,
-                "lr": lr,
-                "max_length": max_length,
-                "train_batch_size": train_batch_size,
-                "validation_batch_size": validation_batch_size
-            }
-        )
+        if wandb_log:
+            run = wandb.init(
+                project="mamba",
+                name=model_name.split("/")[1]+"_"+dataset_name.split("/")[1]+f"_bs-{train_batch_size}_LR-{lr}_maxlen-{max_length}_{run_id}",
+                config={
+                    "model_name": model_name,
+                    "run_id": run_id,
+                    "dataset": dataset_name,
+                    "output_dir": output_dir,
+                    "lr": lr,
+                    "max_length": max_length,
+                    "train_batch_size": train_batch_size,
+                    "validation_batch_size": validation_batch_size
+                }
+            )
 
     if gradient_checkpointing:
         model.gradient_checkpointing_enable()
@@ -141,6 +150,10 @@ def train():
     model.train()
     dist.barrier()
 
+    print_gpu_utilization(local_rank)    
+    time.sleep(10)
+
+    token_count=0    # tokens trained
     for epoch in range(0, epochs):
         train_sampler.set_epoch(epoch)
         current_epoch = epoch + 1
@@ -160,6 +173,7 @@ def train():
                 "input_ids": batch["input_ids"].to("cuda"),
                 "labels": batch["labels"].to("cuda"),
             }
+            token_count+=batch["token_count"]
 
             # forward
             outputs = model(**inputs)
@@ -185,6 +199,7 @@ def train():
             # avg loss over all processes
             loss = get_all_reduce_mean(loss).item()
 
+            token_count_gathered = gather_object( [token_count] )
             if local_rank == 0:
                 log_stats(
                     pbar,
@@ -193,10 +208,10 @@ def train():
                     loss,
                     grad_norm,
                     scheduler,
+                    sum(token_count_gathered)
                 )
 
-            # runs eval 2x an epoch, adjust as needed
-            if should_run_eval(total_steps_per_epoch, 2, current_step):
+            if should_run_eval(total_steps_per_epoch, 3, current_step):
                 validation_loss = evaluation(
                     model,
                     val_loader,
@@ -204,14 +219,15 @@ def train():
                     local_rank,
                 )
                 save_model(local_rank, model, tokenizer, output_dir, current_epoch,current_step)
-
                 model.train()
 
     save_model(local_rank, model, tokenizer, output_dir, epochs, "final")
 
+
 def collate(elements, tokenizer):
     tokenlist=[e["input_ids"] for e in elements]
     tokens_maxlen=max([len(t) for t in tokenlist])
+    token_count=0
 
     input_ids,labels,attention_masks = [],[],[]
     for tokens in tokenlist:
@@ -222,11 +238,21 @@ def collate(elements, tokenizer):
         labels.append( tokens + [-100]*pad_len )    
         attention_masks.append( [1]*len(tokens) + [0]*pad_len ) 
 
+        token_count+=len(tokens)
+
     batch={
         "input_ids": torch.tensor(input_ids),
         "labels": torch.tensor(labels),
+        "token_count": token_count
     }
     return batch
+
+
+def gather_object(object):
+    output_objects = [None for _ in range(dist.get_world_size())]
+    dist.all_gather_object(output_objects, object)
+    return [x for y in output_objects for x in y]
+
 
 def tokenize(element, max_length, tokenizer):
     return tokenizer(
@@ -256,6 +282,7 @@ def get_dataloader(
         sampler=sampler,
     )
     return sampler, loader
+
 
 def disable_model_dropout(model: torch.nn.Module):
     for module in model.modules():
@@ -373,19 +400,19 @@ def get_optimizer(model, lr, weight_decay):
     ]
 
     # https://www.kaggle.com/code/nbroad/8-bit-adam-optimization
-    # optimizer = bnb.optim.Adam8bit(optimizer_grouped_parameters, lr=args.learning_rate)
-        # for module in model.modules():
+    # optimizer = bnb.optim.Adam8bit(optimizer_grouped_parameters, lr=lr)
+    # for module in model.modules():
     #     if isinstance(module, torch.nn.Embedding):
     #         bnb.optim.GlobalOptimManager.get_instance().register_module_override(
     #             module, 'weight', {'optim_bits': 32}
     #         )     
-
+    # return optimizer
     # https://huggingface.co/docs/transformers/main/en/perf_train_gpu_one
     # adam_bnb_optim = bnb.optim.Adam8bit(
-    #     optimizer_grouped_parameters,
-    #     betas=(training_args.adam_beta1, training_args.adam_beta2),
-    #     eps=training_args.adam_epsilon,
-    #     lr=training_args.learning_rate,
+    #     params=optimizer_grouped_parameters,
+    #     # betas=(0.9, 0.95),
+    #     # eps=training_args.adam_epsilon,
+    #     lr=lr
     # )    
 
     return torch.optim.AdamW(
@@ -401,7 +428,7 @@ def should_run_eval(total_steps, times_to_run, current_step):
     return current_step % (total_steps // times_to_run) == 0
 
 
-def log_stats(pbar, wandb, epoch, loss_tensor, grad_norm, scheduler):
+def log_stats(pbar, wandb, epoch, loss_tensor, grad_norm, scheduler, token_count):
     last_lr = scheduler.get_last_lr()[0]
 
     wandb.log(
@@ -410,6 +437,7 @@ def log_stats(pbar, wandb, epoch, loss_tensor, grad_norm, scheduler):
             "current_epoch": epoch,
             "learning_rate": last_lr,
             "grad_norm": grad_norm,
+            "token_count": token_count, 
         },
     )
 
@@ -449,7 +477,9 @@ def save_model(local_rank, model, tokenizer, outpath, current_epoch, current_ste
     if local_rank == 0:
         print(f"SAVING MODEL")
         outpath += f"/epoch_{current_epoch}/step_{current_step}"
-        model.save_pretrained(outpath, state_dict=cpu_state)
+        os.makedirs(outpath)
+        # model.save_pretrained(outpath, state_dict=cpu_state)
+        torch.save(cpu_state, f"{outpath}/pytorch_model.bin")
         tokenizer.save_pretrained(outpath)
 
 
