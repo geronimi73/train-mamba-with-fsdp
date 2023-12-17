@@ -4,13 +4,6 @@ from datasets import load_dataset, DatasetDict, Dataset
 from functools import partial
 from transformers import AutoTokenizer
 
-from core.supervised_dataset import (
-    DEFAULT_PAD_TOKEN,
-    DEFAULT_EOS_TOKEN,
-    DEFAULT_UNK_TOKEN,
-    SupervisedDataset,
-    DataCollatorForSupervisedDataset,
-)
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
@@ -32,9 +25,7 @@ from torch.distributed.fsdp.wrap import (
     transformer_auto_wrap_policy,
     size_based_auto_wrap_policy,
 )
-from transformers.models.mistral.modeling_mistral import MistralDecoderLayer
-from core.multipack_sampler import MultipackDistributedBatchSampler
-from dotenv import load_dotenv
+
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 from mamba_ssm.modules.mamba_simple import Mamba, Block
 
@@ -71,12 +62,11 @@ def train():
     model, tokenizer = setup_model(model_name)
     print("done")
 
-    # Wrap model
+    # Wrap model like RWKV: https://github.com/mrsteyk/RWKV-LM-deepspeed/blob/89a632ff61094b4d6629d4daa379b27e296d3400/RWKV-v4f/train.py#L208
     auto_wrap_policy = functools.partial(
         transformer_auto_wrap_policy,
         transformer_layer_cls={
             Block
-            # Mamba
         },
     )
     fsdp_config = dict(
@@ -213,18 +203,11 @@ def train():
                     wandb,
                     local_rank,
                 )
-
-                # saves model 2x an epoch, adjust as needed above
-                # save_model(
-                #     local_rank,
-                #     model,
-                #     tokenizer,
-                #     output_dir,
-                #     current_epoch,
-                #     current_step,
-                # )
+                save_model(local_rank, model, tokenizer, output_dir, current_epoch,current_step)
 
                 model.train()
+
+    save_model(local_rank, model, tokenizer, output_dir, epochs, "final")
 
 def collate(elements, tokenizer):
     tokenlist=[e["input_ids"] for e in elements]
@@ -263,17 +246,16 @@ def get_dataloader(
 ):
     fsdp_rank, fsdp_world_size = fsdp_info
 
-    sampler = DistributedSampler(dataset=dataset, rank=fsdp_rank, num_replicas=fsdp_world_size, shuffle=False)
+    sampler = DistributedSampler(dataset=dataset, rank=fsdp_rank, num_replicas=fsdp_world_size, shuffle=shuffle)
     loader = DataLoader(
         dataset=dataset,
-        shuffle=False,
+        shuffle=shuffle,
         pin_memory=True,
         batch_size=bs,
         collate_fn=collator,
         sampler=sampler,
     )
     return sampler, loader
-
 
 def disable_model_dropout(model: torch.nn.Module):
     for module in model.modules():
@@ -389,6 +371,22 @@ def get_optimizer(model, lr, weight_decay):
             "weight_decay": 0.0,
         },
     ]
+
+    # https://www.kaggle.com/code/nbroad/8-bit-adam-optimization
+    # optimizer = bnb.optim.Adam8bit(optimizer_grouped_parameters, lr=args.learning_rate)
+        # for module in model.modules():
+    #     if isinstance(module, torch.nn.Embedding):
+    #         bnb.optim.GlobalOptimManager.get_instance().register_module_override(
+    #             module, 'weight', {'optim_bits': 32}
+    #         )     
+
+    # https://huggingface.co/docs/transformers/main/en/perf_train_gpu_one
+    # adam_bnb_optim = bnb.optim.Adam8bit(
+    #     optimizer_grouped_parameters,
+    #     betas=(training_args.adam_beta1, training_args.adam_beta2),
+    #     eps=training_args.adam_epsilon,
+    #     lr=training_args.learning_rate,
+    # )    
 
     return torch.optim.AdamW(
         params=optimizer_grouped_parameters,
