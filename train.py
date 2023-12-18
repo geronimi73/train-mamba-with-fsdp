@@ -63,7 +63,7 @@ def train():
     shuffle = True  
     train_batch_size, validation_batch_size = 2, 1
     epochs = 3  
-    lr = 1e-05
+    lr = 2e-05
     weight_decay = 0.0  
     gradient_clipping = 1.0  
 
@@ -199,19 +199,22 @@ def train():
             # avg loss over all processes
             loss = get_all_reduce_mean(loss).item()
 
-            token_count_gathered = gather_object( [token_count] )
-            if local_rank == 0:
-                log_stats(
-                    pbar,
-                    wandb,
-                    round((current_step / total_steps_per_epoch), 2) + epoch,
-                    loss,
-                    grad_norm,
-                    scheduler,
-                    sum(token_count_gathered)
-                )
+            # log every 4 steps
+            if current_step % 4 == 0:
+                token_count_gathered = gather_object( [token_count] )
+                if local_rank == 0:
+                    log_stats(
+                        pbar,
+                        wandb,
+                        round((current_step / total_steps_per_epoch), 2) + epoch,
+                        loss,
+                        grad_norm,
+                        scheduler,
+                        sum(token_count_gathered)
+                    )
 
-            if should_run_eval(total_steps_per_epoch, 3, current_step):
+            # eval 5 times per epoch
+            if should_run_eval(total_steps_per_epoch, 5, current_step):
                 validation_loss = evaluation(
                     model,
                     val_loader,
